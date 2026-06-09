@@ -1,0 +1,36 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# --- Model weights (regenerate via train.py / experiments.py) ---
+*.pth
+
+# --- Legacy telemetry ---
+*.npy
+
+# --- Generated CSV telemetry (regenerate via train/baseline/evaluate/experiments) ---
+*_telemetry.csv
+training_telemetry.csv
+baseline_telemetry.csv
+eval_telemetry.csv
+results/experiments/*.csv
+
+# --- Generated plots and experiment outputs ---
+results/
+
+# --- Jupyter ---
+.ipynb_checkpoints/

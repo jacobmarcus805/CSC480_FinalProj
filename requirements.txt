@@ -1,0 +1,7 @@
+# Blackjack RL — CSC480 Final Project
+# Python 3.10+ recommended
+
+torch>=2.0.0
+numpy>=1.26.0
+pandas>=2.0.0
+matplotlib>=3.8.0
