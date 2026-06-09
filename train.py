@@ -1,164 +1,275 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
+#!/usr/bin/env python3
+"""Train a Double DQN blackjack agent."""
+
+import argparse
+import csv
+import os
 import random
+import sys
+
 import numpy as np
+import torch
 
-from environment import SixDeckBlackjack, STATE_DIM
-from agent import ReplayBuffer, BlackjackDQN
+from agent import BlackjackAgent
+from environment import STATE_DIM, SixDeckBlackjack, legal_action_mask_batch
 
-# --- HYPERPARAMETERS ---
+# --- DEFAULT HYPERPARAMETERS ---
 BATCH_SIZE = 128
 GAMMA = 0.99
-LEARNING_RATE = 1e-4    # Lower LR for stability with Huber + soft updates
-EPISODES = 200000
-TAU = 0.005             # Soft target update rate (Polyak)
+LEARNING_RATE = 1e-4
+TAU = 0.005
 GRAD_CLIP = 1.0
-
-# Epsilon parameters (in env steps)
 EPS_START = 1.0
 EPS_END = 0.05
 EPS_DECAY = 60000
+ROLLING_WINDOW = 1000
+
+TELEMETRY_FIELDS = [
+    "episode",
+    "total_reward",
+    "rolling_avg_reward",
+    "epsilon",
+    "outcome",
+    "illegal_action_count",
+    "num_actions",
+    "bet_amount",
+    "true_count_at_bet",
+    "avg_loss",
+]
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train a blackjack DQN agent.")
+    parser.add_argument("--episodes", type=int, default=200_000, help="Number of hands to train.")
+    parser.add_argument("--log-interval", type=int, default=1000, help="Print a summary every N episodes.")
+    parser.add_argument("--save-path", type=str, default="blackjack_card_counter_v1.pth", help="Final model path.")
+    parser.add_argument(
+        "--telemetry-path",
+        type=str,
+        default="training_telemetry.csv",
+        help="CSV file for per-episode telemetry.",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=5000,
+        help="Save a model checkpoint every N episodes (0 disables).",
+    )
+    parser.add_argument(
+        "--eval",
+        action="store_true",
+        help="Run greedy evaluation only (no training); requires --save-path to exist.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Verbose mode: log every episode to stdout.",
+    )
+    return parser.parse_args()
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
 
 def legal_action_mask(states: torch.Tensor) -> torch.Tensor:
-    """Vectorized legal-action mask for a batch of state tensors.
-
-    Mirrors `SixDeckBlackjack.legal_actions()` so that bootstrap targets and
-    greedy action selection both ignore illegal actions. Without this, the
-    `max` over Q-values during the target computation leaks the values of
-    actions the agent never actually faces, biasing learning.
-
-    Layout: state[:, 0]=phase, state[:, 5]=num_cards/10.
-    """
-    B = states.shape[0]
-    mask = torch.zeros(B, 7, dtype=torch.bool, device=states.device)
-
-    phase = states[:, 0]
-    num_cards = (states[:, 5] * 10).round()
-
-    is_phase0 = phase < 0.5
-    is_phase1 = ~is_phase0
-    has_two_cards = num_cards == 2
-
-    # Phase 0: bets 0, 1, 2 legal
-    mask[is_phase0, 0] = True
-    mask[is_phase0, 1] = True
-    mask[is_phase0, 2] = True
-
-    # Phase 1: hit (3) and stand (4) always legal
-    mask[is_phase1, 3] = True
-    mask[is_phase1, 4] = True
-    # Double (5) only legal on first two cards
-    mask[is_phase1 & has_two_cards, 5] = True
-
-    # Action 6 (split) is never legal in this build.
-    return mask
+    """Torch wrapper around ``environment.legal_action_mask_batch``."""
+    mask_np = legal_action_mask_batch(states.detach().cpu().numpy())
+    return torch.from_numpy(mask_np).to(device=states.device)
 
 
-def select_action(env, state, policy_net, epsilon):
-    """Epsilon-greedy action selection that always respects legal_actions()."""
-    legal = env.legal_actions()
-    if random.random() < epsilon:
-        return random.choice(legal)
-
-    state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-    with torch.no_grad():
-        q_values = policy_net(state_tensor).squeeze(0).clone()
-
-    mask = torch.full_like(q_values, float('-inf'))
-    for a in legal:
-        mask[a] = 0.0
-    q_values = q_values + mask
-    return int(q_values.argmax().item())
+def epsilon_for_step(steps_done: int) -> float:
+    return EPS_END + (EPS_START - EPS_END) * np.exp(-steps_done / EPS_DECAY)
 
 
-def soft_update(target_net, policy_net, tau):
-    for tp, sp in zip(target_net.parameters(), policy_net.parameters()):
-        tp.data.copy_(tau * sp.data + (1.0 - tau) * tp.data)
+def checkpoint_path(save_path: str, episode: int) -> str:
+    stem, ext = os.path.splitext(save_path)
+    ext = ext or ".pth"
+    return f"{stem}_ep{episode:06d}{ext}"
 
 
-def train_agent():
-    print("Initializing Casino and AI...")
+def classify_outcome(total_reward: float) -> str:
+    if total_reward > 0:
+        return "win"
+    if total_reward < 0:
+        return "loss"
+    return "push"
+
+
+def is_illegal_step(info: dict) -> bool:
+    return "Illegal" in info.get("msg", "")
+
+
+def init_telemetry_csv(path: str) -> None:
+    with open(path, "w", newline="") as f:
+        csv.DictWriter(f, fieldnames=TELEMETRY_FIELDS).writeheader()
+
+
+def append_telemetry_row(path: str, row: dict) -> None:
+    with open(path, "a", newline="") as f:
+        csv.DictWriter(f, fieldnames=TELEMETRY_FIELDS).writerow(row)
+
+
+def rolling_average(rewards: list[float], window: int = ROLLING_WINDOW) -> float:
+    if not rewards:
+        return 0.0
+    window_rewards = rewards[-window:]
+    return float(np.mean(window_rewards))
+
+
+def run_eval(args) -> None:
+    if not os.path.isfile(args.save_path):
+        print(f"Model not found: {args.save_path}", file=sys.stderr)
+        sys.exit(1)
+
+    set_seed(args.seed)
     env = SixDeckBlackjack()
-    memory = ReplayBuffer(capacity=200000)
+    agent = BlackjackAgent(
+        state_dim=STATE_DIM,
+        action_dim=7,
+        batch_size=BATCH_SIZE,
+        buffer_capacity=1,
+    )
+    agent.load(args.save_path)
+    agent.policy_net.eval()
 
-    policy_net = BlackjackDQN(input_dim=STATE_DIM, output_dim=7)
-    target_net = BlackjackDQN(input_dim=STATE_DIM, output_dim=7)
-    target_net.load_state_dict(policy_net.state_dict())
-    target_net.eval()
+    rewards = []
+    wins = losses = pushes = 0
 
-    optimizer = optim.Adam(policy_net.parameters(), lr=LEARNING_RATE)
-    loss_fn = nn.SmoothL1Loss()  # Huber loss
-
-    steps_done = 0
-    history_rewards = []
-    history_epsilon = []
-
-    print("Starting Training Loop...")
-    for episode in range(EPISODES):
+    for episode in range(args.episodes):
         state = env.reset()
         done = False
-        current_episode_reward = 0
+        hand_reward = 0.0
+
+        while not done:
+            action = agent.select_action(state, env.legal_actions(), epsilon=0.0)
+            state, reward, done, _ = env.step(action)
+            hand_reward += reward
+
+        rewards.append(hand_reward)
+        outcome = classify_outcome(hand_reward)
+        if outcome == "win":
+            wins += 1
+        elif outcome == "loss":
+            losses += 1
+        else:
+            pushes += 1
+
+        if args.debug or (episode + 1) % args.log_interval == 0:
+            print(
+                f"Eval {episode + 1}/{args.episodes} | "
+                f"hand=${hand_reward:.2f} | rolling=${rolling_average(rewards):.2f}"
+            )
+
+    print(
+        f"Eval complete: mean=${np.mean(rewards):.2f}/hand | "
+        f"wins={wins} losses={losses} pushes={pushes}"
+    )
+
+
+def train_agent(args) -> None:
+    set_seed(args.seed)
+
+    env = SixDeckBlackjack()
+    agent = BlackjackAgent(
+        state_dim=STATE_DIM,
+        action_dim=7,
+        lr=LEARNING_RATE,
+        gamma=GAMMA,
+        batch_size=BATCH_SIZE,
+        buffer_capacity=200_000,
+        grad_clip=GRAD_CLIP,
+    )
+
+    init_telemetry_csv(args.telemetry_path)
+
+    steps_done = 0
+    episode_rewards: list[float] = []
+
+    print(
+        f"Training {args.episodes:,} hands | seed={args.seed} | "
+        f"telemetry={args.telemetry_path}"
+    )
+
+    for episode in range(args.episodes):
+        state = env.reset()
+        true_count_at_bet = env._get_true_count()
+        done = False
+
+        total_reward = 0.0
+        illegal_action_count = 0
+        num_actions = 0
+        episode_losses: list[float] = []
+        epsilon = EPS_END
 
         while not done:
             steps_done += 1
-            epsilon = EPS_END + (EPS_START - EPS_END) * np.exp(-1. * steps_done / EPS_DECAY)
-            action = select_action(env, state, policy_net, epsilon)
+            epsilon = epsilon_for_step(steps_done)
+            action = agent.select_action(state, env.legal_actions(), epsilon)
+            next_state, reward, done, info = env.step(action)
 
-            next_state, reward, done, _ = env.step(action)
-            current_episode_reward += reward
+            num_actions += 1
+            total_reward += reward
+            if is_illegal_step(info):
+                illegal_action_count += 1
 
-            memory.push(state, action, reward / 100.0, next_state, done)
+            agent.remember(state, action, reward / 100.0, next_state, done)
             state = next_state
 
-            if len(memory) > BATCH_SIZE:
-                states, actions, rewards, next_states, dones = memory.sample(BATCH_SIZE)
+            loss = agent.learn(legal_action_mask)
+            if loss is not None:
+                episode_losses.append(loss)
+                agent.soft_update_target(TAU)
 
-                current_q = policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        bet_amount = env.current_bet
+        outcome = classify_outcome(total_reward)
+        avg_loss = float(np.mean(episode_losses)) if episode_losses else 0.0
+        episode_rewards.append(total_reward)
+        roll_avg = rolling_average(episode_rewards)
 
-                with torch.no_grad():
-                    # --- Double DQN with masked legality ---
-                    # Select next action with the online (policy) net so we don't
-                    # propagate optimistic target-net noise; evaluate with target.
-                    next_q_policy = policy_net(next_states)
-                    legal_next = legal_action_mask(next_states)
-                    next_q_policy = next_q_policy.masked_fill(~legal_next, float('-inf'))
-                    best_next_actions = next_q_policy.argmax(1, keepdim=True)
+        append_telemetry_row(
+            args.telemetry_path,
+            {
+                "episode": episode,
+                "total_reward": round(total_reward, 2),
+                "rolling_avg_reward": round(roll_avg, 2),
+                "epsilon": round(epsilon, 4),
+                "outcome": outcome,
+                "illegal_action_count": illegal_action_count,
+                "num_actions": num_actions,
+                "bet_amount": bet_amount,
+                "true_count_at_bet": true_count_at_bet,
+                "avg_loss": round(avg_loss, 6),
+            },
+        )
 
-                    next_q_target = target_net(next_states).gather(1, best_next_actions).squeeze(1)
-                    # Terminal states have no future return.
-                    next_q_target = torch.where(
-                        dones.bool(),
-                        torch.zeros_like(next_q_target),
-                        next_q_target,
-                    )
-                    target_q = rewards + GAMMA * next_q_target
+        if args.checkpoint_interval and (episode + 1) % args.checkpoint_interval == 0:
+            ckpt = checkpoint_path(args.save_path, episode + 1)
+            agent.save(ckpt)
+            print(f"Checkpoint saved: {ckpt}")
 
-                loss = loss_fn(current_q, target_q)
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(policy_net.parameters(), GRAD_CLIP)
-                optimizer.step()
+        if args.debug or episode % args.log_interval == 0:
+            print(
+                f"Hand {episode}/{args.episodes} | eps={epsilon:.3f} | "
+                f"reward=${total_reward:.2f} | rolling=${roll_avg:.2f} | "
+                f"{outcome} | illegal={illegal_action_count} | "
+                f"bet=${bet_amount} | tc={true_count_at_bet} | loss={avg_loss:.4f}"
+            )
 
-                # Soft update target network every step
-                soft_update(target_net, policy_net, TAU)
+    agent.save(args.save_path)
+    print(f"Training complete. Model saved to {args.save_path}")
+    print(f"Telemetry saved to {args.telemetry_path}")
 
-        history_rewards.append(current_episode_reward)
-        history_epsilon.append(epsilon)
 
-        if episode % 1000 == 0:
-            window = history_rewards[-1000:] if len(history_rewards) >= 1000 else history_rewards
-            recent = float(np.mean(window)) if window else 0.0
-            print(f"Hand {episode}/{EPISODES} | eps={epsilon:.3f} | last1k_avg=${recent:.2f}")
-
-    print("Training Complete!")
-    torch.save(policy_net.state_dict(), "blackjack_card_counter_v1.pth")
-    np.save("training_telemetry.npy", {
-        "rewards": history_rewards,
-        "epsilons": history_epsilon,
-    })
+def main():
+    args = parse_args()
+    if args.eval:
+        run_eval(args)
+    else:
+        train_agent(args)
 
 
 if __name__ == "__main__":
-    train_agent()
+    main()
