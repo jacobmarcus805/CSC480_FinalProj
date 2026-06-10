@@ -49,16 +49,19 @@ TELEMETRY_FIELDS = [
 EXPERIMENT_DIR = os.path.join("results", "experiments")
 DEFAULT_MODEL_PATH = "blackjack_card_counter_v1.pth"
 
-DQN_EVAL_NAME = "dqn_betting_play"
-FIXED_BET_EVAL_NAME = "fixed_betting_play_agent"
-HYBRID_BET_EVAL_NAME = "hybrid_count_betting_eval"
-RANDOM_BASELINE_NAME = "random_baseline"
+# names for the four strategies we pit against each other in --compare-eval
+DQN_EVAL_NAME = "dqn_betting_play"              # full DQN — bet and play
+FIXED_BET_EVAL_NAME = "fixed_betting_play_agent"  # flat $10 bet, DQN plays
+HYBRID_BET_EVAL_NAME = "hybrid_count_betting_eval"  # bet by count, DQN plays
+RANDOM_BASELINE_NAME = "random_baseline"        # random everything
 
+# per-mode eval telemetry CSVs (written by run_compare_eval_modes)
 DQN_EVAL_CSV = os.path.join(EXPERIMENT_DIR, "dqn_eval.csv")
 FIXED_BET_EVAL_CSV = os.path.join(EXPERIMENT_DIR, "fixed_bet_eval.csv")
 HYBRID_BET_EVAL_CSV = os.path.join(EXPERIMENT_DIR, "hybrid_bet_eval.csv")
 RANDOM_BASELINE_EVAL_CSV = os.path.join(EXPERIMENT_DIR, "random_baseline_eval.csv")
 
+# valid eval choices --only to run a single eval mode instead of training
 EVAL_MODE_CHOICES = [
     FIXED_BET_EVAL_NAME,
     HYBRID_BET_EVAL_NAME,
@@ -97,6 +100,7 @@ EXPERIMENTS = [
 
 
 def parse_args():
+    """Parse command-line flags."""
     parser = argparse.ArgumentParser(
         description="Run blackjack DQN training experiments and compare eval results."
     )
@@ -123,21 +127,25 @@ def parse_args():
 
 
 def set_seed(seed: int) -> None:
+    """Same seed every run so results are comparable."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
 
 def legal_action_mask(states: torch.Tensor) -> torch.Tensor:
+    """Call the env's mask helper and get the result back on the right device."""
     mask_np = legal_action_mask_batch(states.detach().cpu().numpy())
     return torch.from_numpy(mask_np).to(device=states.device)
 
 
 def epsilon_for_step(steps_done: int, eps_decay: int) -> float:
+    """How much random exploration is left after this many steps."""
     return EPS_END + (EPS_START - EPS_END) * np.exp(-steps_done / eps_decay)
 
 
 def classify_outcome(total_reward: float) -> str:
+    """Did we win money, lose money, or break even?"""
     if total_reward > 0:
         return "win"
     if total_reward < 0:
@@ -146,27 +154,32 @@ def classify_outcome(total_reward: float) -> str:
 
 
 def is_illegal_step(info: dict) -> bool:
+    """Did the agent try something that isn't allowed?"""
     return "Illegal" in info.get("msg", "")
 
 
 def init_telemetry_csv(path: str) -> None:
+    """Start a fresh telemetry CSV with column headers."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", newline="") as f:
         csv.DictWriter(f, fieldnames=TELEMETRY_FIELDS).writeheader()
 
 
 def append_telemetry_row(path: str, row: dict) -> None:
+    """Log one hand to the telemetry CSV."""
     with open(path, "a", newline="") as f:
         csv.DictWriter(f, fieldnames=TELEMETRY_FIELDS).writerow(row)
 
 
 def rolling_average(rewards: list[float], window: int = ROLLING_WINDOW) -> float:
+    """Average $/hand over the last N hands."""
     if not rewards:
         return 0.0
     return float(np.mean(rewards[-window:]))
 
 
 def experiment_paths(name: str) -> dict[str, str]:
+    """Where to save the model, training log, and eval log for one experiment."""
     return {
         "model": os.path.join(EXPERIMENT_DIR, f"{name}_model.pth"),
         "train_csv": os.path.join(EXPERIMENT_DIR, f"{name}_training.csv"),
@@ -175,6 +188,7 @@ def experiment_paths(name: str) -> dict[str, str]:
 
 
 def train_experiment(config: ExperimentConfig, seed: int) -> str:
+    """Train with one config's settings. Returns path to saved weights."""
     paths = experiment_paths(config.name)
     set_seed(seed)
 
@@ -225,7 +239,7 @@ def train_experiment(config: ExperimentConfig, seed: int) -> str:
             agent.remember(state, action, reward / 100.0, next_state, done)
             state = next_state
 
-            loss = agent.learn(legal_action_mask)
+            loss = agent.learn(legal_action_mask)  # copied from train.py
             if loss is not None:
                 episode_losses.append(loss)
                 agent.soft_update_target(TAU)
@@ -279,6 +293,7 @@ class EvalSummary:
 
 
 def evaluate_experiment(config: ExperimentConfig, seed: int) -> EvalSummary:
+    """Play out 50k hands with no exploration and collect stats."""
     paths = experiment_paths(config.name)
     set_seed(seed)
 
@@ -365,6 +380,7 @@ def evaluate_experiment(config: ExperimentConfig, seed: int) -> EvalSummary:
 
 
 def print_summary(summary: EvalSummary, n: int) -> None:
+    """Dump win rate, avg bet, etc. for one eval run."""
     print(f"  Average reward/hand: ${summary.avg_reward:.2f}")
     print(
         f"  Win/loss/push: {summary.wins}/{summary.losses}/{summary.pushes} "
@@ -376,7 +392,8 @@ def print_summary(summary: EvalSummary, n: int) -> None:
 
 
 def hybrid_count_bet_action(true_count: int) -> int:
-    """Map true count at bet time to a fixed betting action ID."""
+    """Hard-coded bet sizing for the hybrid eval — not learned."""
+    # rough card-counter spread, only here to see if it beats learned betting
     if true_count >= 2:
         return BET_100
     if true_count <= -1:
@@ -385,6 +402,7 @@ def hybrid_count_bet_action(true_count: int) -> int:
 
 
 def print_comparison_table(summaries: list[EvalSummary], title: str = "EXPERIMENT COMPARISON") -> None:
+    """Print eval results in a table so you can compare at a glance."""
     print("\n" + "=" * 88)
     print(f"{title} ({EVAL_EPISODES:,}-hand eval)")
     print("=" * 88)
@@ -408,6 +426,7 @@ def print_comparison_table(summaries: list[EvalSummary], title: str = "EXPERIMEN
 
 
 def run_experiment(config: ExperimentConfig, seed: int) -> EvalSummary:
+    """Train, then immediately eval the model we just saved."""
     train_experiment(config, seed)
     return evaluate_experiment(config, seed)
 
@@ -419,22 +438,26 @@ ActionSelector = Callable[
 
 
 def _dqn_full_action(env, state, agent, _true_count_at_bet):
+    """DQN controls everything."""
     return agent.select_action(state, env.legal_actions(), epsilon=0.0)
 
 
 def _fixed_bet_dqn_play(env, state, agent, _true_count_at_bet):
-    if env.phase == 0:
+    """$10 every hand — only tests how well the DQN plays."""
+    if env.phase == 0:  # ignore what the network wants to bet
         return BET_10
     return agent.select_action(state, env.legal_actions(), epsilon=0.0)
 
 
 def _hybrid_bet_dqn_play(env, state, agent, true_count_at_bet):
+    """Bet size from true count, hit/stand from the DQN."""
     if env.phase == 0:
         return hybrid_count_bet_action(true_count_at_bet)
     return agent.select_action(state, env.legal_actions(), epsilon=0.0)
 
 
 def _random_action(env, state, _agent, _true_count_at_bet):
+    """Pick a random legal move — our floor to beat."""
     return random.choice(env.legal_actions())
 
 
@@ -447,8 +470,9 @@ def run_policy_eval(
     episodes: int = EVAL_EPISODES,
     description: str = "",
 ) -> EvalSummary:
-    """Run a 50k-hand eval with a custom betting/play action selector."""
+    """Run N hands with whatever action picker you pass in."""
     agent = None
+    # random mode doesn't need a model at all
     if model_path is not None:
         if not os.path.isfile(model_path):
             raise FileNotFoundError(f"Model not found: {model_path}")
@@ -482,6 +506,7 @@ def run_policy_eval(
         num_actions = 0
 
         while not done:
+            # the callback picks the move — depends which strategy we're running
             action = select_action(env, state, agent, true_count_at_bet)
             state, reward, done, info = env.step(action)
             total_reward += reward
@@ -545,6 +570,7 @@ def run_fixed_betting_play_eval(
     telemetry_path: str = FIXED_BET_EVAL_CSV,
     episodes: int = EVAL_EPISODES,
 ) -> EvalSummary:
+    """Fixed $10 bet, DQN plays the hand."""
     return run_policy_eval(
         name=FIXED_BET_EVAL_NAME,
         select_action=_fixed_bet_dqn_play,
@@ -562,6 +588,7 @@ def run_hybrid_count_betting_eval(
     telemetry_path: str = HYBRID_BET_EVAL_CSV,
     episodes: int = EVAL_EPISODES,
 ) -> EvalSummary:
+    """Count-based betting, DQN plays the hand."""
     return run_policy_eval(
         name=HYBRID_BET_EVAL_NAME,
         select_action=_hybrid_bet_dqn_play,
@@ -577,7 +604,7 @@ def run_hybrid_count_betting_eval(
 
 
 def run_compare_eval_modes(model_path: str, seed: int) -> list[EvalSummary]:
-    """Compare DQN, fixed $10, hybrid count betting, and random baseline."""
+    """Run all four strategies on the same model and print who's ahead."""
     print("Eval Mode Comparison (no retraining)")
     print(f"Model: {model_path} | seed={seed} | hands={EVAL_EPISODES:,}")
 
@@ -610,11 +637,12 @@ def run_compare_eval_modes(model_path: str, seed: int) -> list[EvalSummary]:
 
 
 def main():
+    """Figure out what the user asked for and run it."""
     args = parse_args()
     os.makedirs(EXPERIMENT_DIR, exist_ok=True)
 
     if args.compare_eval or args.only == "compare_eval":
-        run_compare_eval_modes(args.model_path, args.seed)
+        run_compare_eval_modes(args.model_path, args.seed)  # uses existing weights, doesn't train
         return
 
     if args.only == FIXED_BET_EVAL_NAME:

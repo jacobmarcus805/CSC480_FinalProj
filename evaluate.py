@@ -30,6 +30,7 @@ TELEMETRY_FIELDS = [
 
 
 def parse_args():
+    """CLI args for greedy eval."""
     parser = argparse.ArgumentParser(description="Evaluate a trained blackjack DQN.")
     parser.add_argument("--episodes", type=int, default=10_000, help="Number of hands to play.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -49,12 +50,14 @@ def parse_args():
 
 
 def set_seed(seed: int) -> None:
+    """Fix random/numpy/torch seeds."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
 
 def classify_outcome(total_reward: float) -> str:
+    """win / loss / push from hand profit."""
     if total_reward > 0:
         return "win"
     if total_reward < 0:
@@ -63,33 +66,38 @@ def classify_outcome(total_reward: float) -> str:
 
 
 def is_illegal_step(info: dict) -> bool:
+    """True if env.step flagged an illegal move."""
     return "Illegal" in info.get("msg", "")
 
 
 def init_telemetry_csv(path: str) -> None:
+    """Write the telemetry CSV header row."""
     with open(path, "w", newline="") as f:
         csv.DictWriter(f, fieldnames=TELEMETRY_FIELDS).writeheader()
 
 
 def append_telemetry_row(path: str, row: dict) -> None:
+    """Append one episode row to the telemetry CSV."""
     with open(path, "a", newline="") as f:
         csv.DictWriter(f, fieldnames=TELEMETRY_FIELDS).writerow(row)
 
 
 def rolling_average(rewards: list[float], window: int = ROLLING_WINDOW) -> float:
+    """Mean reward over the last `window` hands."""
     if not rewards:
         return 0.0
     return float(np.mean(rewards[-window:]))
 
 
 def run_evaluation(args) -> None:
+    """Run the trained agent greedily (epsilon=0) and print summary stats."""
     if not os.path.isfile(args.model_path):
         print(f"Model not found: {args.model_path}", file=sys.stderr)
         sys.exit(1)
 
     set_seed(args.seed)
     env = SixDeckBlackjack()
-    agent = BlackjackAgent(state_dim=STATE_DIM, action_dim=7, batch_size=128, buffer_capacity=1)
+    agent = BlackjackAgent(state_dim=STATE_DIM, action_dim=7, batch_size=128, buffer_capacity=1)  # inference only
     agent.load(args.model_path)
     agent.policy_net.eval()
 
@@ -108,7 +116,7 @@ def run_evaluation(args) -> None:
 
     for episode in range(args.episodes):
         state = env.reset()
-        true_count_at_bet = env._get_true_count()
+        true_count_at_bet = env._get_true_count()  # logged before the deal
         done = False
 
         total_reward = 0.0
@@ -116,7 +124,7 @@ def run_evaluation(args) -> None:
         num_actions = 0
 
         while not done:
-            action = agent.select_action(state, env.legal_actions(), epsilon=0.0)
+            action = agent.select_action(state, env.legal_actions(), epsilon=0.0)  # pure greedy policy
             state, reward, done, info = env.step(action)
             total_reward += reward
             num_actions += 1
@@ -167,6 +175,7 @@ def run_evaluation(args) -> None:
 
 
 def main():
+    """Entry point."""
     run_evaluation(parse_args())
 
 

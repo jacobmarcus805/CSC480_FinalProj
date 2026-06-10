@@ -38,6 +38,7 @@ TELEMETRY_FIELDS = [
 ]
 
 def parse_args():
+    """Parse command-line flags."""
     parser = argparse.ArgumentParser(description="Train a blackjack DQN agent.")
     parser.add_argument("--episodes", type=int, default=200_000, help="Number of hands to train.")
     parser.add_argument("--log-interval", type=int, default=1000, help="Print a summary every N episodes.")
@@ -69,28 +70,33 @@ def parse_args():
 
 
 def set_seed(seed: int) -> None:
+    """Same seed every run so results are comparable."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
 
 def legal_action_mask(states: torch.Tensor) -> torch.Tensor:
-    """Torch wrapper around ``environment.legal_action_mask_batch``."""
+    """Call the env's mask helper and get the result back on the right device."""
+    # the env does this in numpy — hop to CPU, then back to wherever the tensor lives
     mask_np = legal_action_mask_batch(states.detach().cpu().numpy())
     return torch.from_numpy(mask_np).to(device=states.device)
 
 
 def epsilon_for_step(steps_done: int) -> float:
+    """How much random exploration is left after this many steps."""
     return EPS_END + (EPS_START - EPS_END) * np.exp(-steps_done / EPS_DECAY)
 
 
 def checkpoint_path(save_path: str, episode: int) -> str:
+    """Turn blackjack_card_counter_v1.pth into blackjack_card_counter_v1_ep005000.pth etc."""
     stem, ext = os.path.splitext(save_path)
     ext = ext or ".pth"
     return f"{stem}_ep{episode:06d}{ext}"
 
 
 def classify_outcome(total_reward: float) -> str:
+    """Did we win money, lose money, or break even?"""
     if total_reward > 0:
         return "win"
     if total_reward < 0:
@@ -99,20 +105,24 @@ def classify_outcome(total_reward: float) -> str:
 
 
 def is_illegal_step(info: dict) -> bool:
+    """Did the agent try something that isn't allowed?"""
     return "Illegal" in info.get("msg", "")
 
 
 def init_telemetry_csv(path: str) -> None:
+    """Start a fresh telemetry CSV with column headers."""
     with open(path, "w", newline="") as f:
         csv.DictWriter(f, fieldnames=TELEMETRY_FIELDS).writeheader()
 
 
 def append_telemetry_row(path: str, row: dict) -> None:
+    """Log one hand to the telemetry CSV."""
     with open(path, "a", newline="") as f:
         csv.DictWriter(f, fieldnames=TELEMETRY_FIELDS).writerow(row)
 
 
 def rolling_average(rewards: list[float], window: int = ROLLING_WINDOW) -> float:
+    """Average $/hand over the last N hands."""
     if not rewards:
         return 0.0
     window_rewards = rewards[-window:]
@@ -120,6 +130,7 @@ def rolling_average(rewards: list[float], window: int = ROLLING_WINDOW) -> float
 
 
 def run_eval(args) -> None:
+    """Test a saved model with --eval. No training, no CSV."""
     if not os.path.isfile(args.save_path):
         print(f"Model not found: {args.save_path}", file=sys.stderr)
         sys.exit(1)
@@ -130,7 +141,7 @@ def run_eval(args) -> None:
         state_dim=STATE_DIM,
         action_dim=7,
         batch_size=BATCH_SIZE,
-        buffer_capacity=1,
+        buffer_capacity=1,  # we're not training, don't need a replay buffer
     )
     agent.load(args.save_path)
     agent.policy_net.eval()
@@ -144,7 +155,7 @@ def run_eval(args) -> None:
         hand_reward = 0.0
 
         while not done:
-            action = agent.select_action(state, env.legal_actions(), epsilon=0.0)
+            action = agent.select_action(state, env.legal_actions(), epsilon=0.0)  # no random moves
             state, reward, done, _ = env.step(action)
             hand_reward += reward
 
@@ -170,6 +181,7 @@ def run_eval(args) -> None:
 
 
 def train_agent(args) -> None:
+    """Play hands, update the network, write telemetry, save weights."""
     set_seed(args.seed)
 
     env = SixDeckBlackjack()
@@ -195,7 +207,7 @@ def train_agent(args) -> None:
 
     for episode in range(args.episodes):
         state = env.reset()
-        true_count_at_bet = env._get_true_count()
+        true_count_at_bet = env._get_true_count()  # snapshot before the deal
         done = False
 
         total_reward = 0.0
@@ -204,8 +216,9 @@ def train_agent(args) -> None:
         episode_losses: list[float] = []
         epsilon = EPS_END
 
+        # a single hand = bet step + however many hit/stand moves
         while not done:
-            steps_done += 1
+            steps_done += 1  # epsilon drops per action, not per hand
             epsilon = epsilon_for_step(steps_done)
             action = agent.select_action(state, env.legal_actions(), epsilon)
             next_state, reward, done, info = env.step(action)
@@ -215,9 +228,10 @@ def train_agent(args) -> None:
             if is_illegal_step(info):
                 illegal_action_count += 1
 
-            agent.remember(state, action, reward / 100.0, next_state, done)
+            agent.remember(state, action, reward / 100.0, next_state, done)  # divide by 100 so rewards aren't huge
             state = next_state
 
+            # update weights every step once we have enough memories saved up
             loss = agent.learn(legal_action_mask)
             if loss is not None:
                 episode_losses.append(loss)
@@ -246,7 +260,7 @@ def train_agent(args) -> None:
         )
 
         if args.checkpoint_interval and (episode + 1) % args.checkpoint_interval == 0:
-            ckpt = checkpoint_path(args.save_path, episode + 1)
+            ckpt = checkpoint_path(args.save_path, episode + 1)  # save midway in case training dies
             agent.save(ckpt)
             print(f"Checkpoint saved: {ckpt}")
 
@@ -264,6 +278,7 @@ def train_agent(args) -> None:
 
 
 def main():
+    """Train, or run --eval if that's what was asked for."""
     args = parse_args()
     if args.eval:
         run_eval(args)

@@ -26,6 +26,7 @@ TELEMETRY_FIELDS = [
 
 
 def parse_args():
+    """CLI args for the random baseline run."""
     parser = argparse.ArgumentParser(description="Random blackjack baseline.")
     parser.add_argument("--episodes", type=int, default=10_000, help="Number of hands to play.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -39,11 +40,13 @@ def parse_args():
 
 
 def set_seed(seed: int) -> None:
+    """Fix random/numpy seeds so runs are reproducible."""
     random.seed(seed)
     np.random.seed(seed)
 
 
 def classify_outcome(total_reward: float) -> str:
+    """Tag a hand as win, loss, or push from its dollar total."""
     if total_reward > 0:
         return "win"
     if total_reward < 0:
@@ -52,22 +55,26 @@ def classify_outcome(total_reward: float) -> str:
 
 
 def init_telemetry_csv(path: str) -> None:
+    """Write the telemetry CSV header row."""
     with open(path, "w", newline="") as f:
         csv.DictWriter(f, fieldnames=TELEMETRY_FIELDS).writeheader()
 
 
 def append_telemetry_row(path: str, row: dict) -> None:
+    """Append one episode row to the telemetry CSV."""
     with open(path, "a", newline="") as f:
         csv.DictWriter(f, fieldnames=TELEMETRY_FIELDS).writerow(row)
 
 
 def rolling_average(rewards: list[float], window: int = ROLLING_WINDOW) -> float:
+    """Mean reward over the last `window` hands."""
     if not rewards:
         return 0.0
     return float(np.mean(rewards[-window:]))
 
 
 def run_baseline(args) -> None:
+    """Play out hands with uniformly random legal actions and log stats."""
     set_seed(args.seed)
     env = SixDeckBlackjack()
     init_telemetry_csv(args.telemetry_path)
@@ -82,6 +89,7 @@ def run_baseline(args) -> None:
 
     for episode in range(args.episodes):
         state = env.reset()
+        # snapshot count before any cards are dealt this hand
         true_count_at_bet = env._get_true_count()
         done = False
 
@@ -89,6 +97,7 @@ def run_baseline(args) -> None:
         num_actions = 0
 
         while not done:
+            # only pick from legal moves — baseline never cheats with illegal actions
             action = random.choice(env.legal_actions())
             state, reward, done, _ = env.step(action)
             total_reward += reward
@@ -115,7 +124,7 @@ def run_baseline(args) -> None:
                 "episode": episode,
                 "total_reward": round(total_reward, 2),
                 "rolling_avg_reward": round(roll_avg, 2),
-                "epsilon": 1.0,
+                "epsilon": 1.0,  # no exploration here; 1.0 keeps CSV columns aligned with training
                 "outcome": outcome,
                 "illegal_action_count": 0,
                 "num_actions": num_actions,
@@ -137,6 +146,7 @@ def run_baseline(args) -> None:
 
 
 def main():
+    """Entry point."""
     run_baseline(parse_args())
 
 

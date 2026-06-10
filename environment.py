@@ -21,6 +21,7 @@ PLAYING_ACTIONS = (HIT, STAND)
 
 class SixDeckBlackjack:
     def __init__(self):
+        """Set up a fresh six-deck shoe and empty count history."""
         # 0: Bet $10, 1: Bet $50, 2: Bet $100
         # 3: Hit, 4: Stand, 5: Double Down, 6: Split (disabled)
         self.action_space = [0, 1, 2, 3, 4, 5, 6]
@@ -28,10 +29,10 @@ class SixDeckBlackjack:
         # Hi-Lo card-count history (10 buckets: cards 2-9, 10, Ace)
         self.deck_history = np.zeros(10)
         self.shoe = self._build_shoe()
-        self.penetration_limit = 312 * 0.25  # Reshuffle when 75% empty
+        self.penetration_limit = 312 * 0.25  # 6 decks = 312 cards; reshuffle when 75% dealt
 
     def reset(self):
-        # Called at the start of every new hand
+        """Start a new hand. Reshuffles if the shoe is low."""
         if len(self.shoe) < self.penetration_limit:
             self.shoe = self._build_shoe()
             self.deck_history = np.zeros(10)
@@ -60,7 +61,7 @@ class SixDeckBlackjack:
         return actions
 
     def step(self, action):
-        """The core engine. Takes the AI's action and advances the game."""
+        """Apply one action and return (state, reward, done, info)."""
 
         # --- PHASE 0: BETTING ---
         if self.phase == 0:
@@ -78,6 +79,7 @@ class SixDeckBlackjack:
                 return self._get_state(), reward, True, {"msg": msg}
 
             self.phase = 1
+            # no money yet — payout comes when the hand actually ends
             return self._get_state(), 0, False, {"msg": "Bet placed"}
 
         # --- PHASE 1: PLAYING ---
@@ -90,7 +92,7 @@ class SixDeckBlackjack:
                 if self._calculate_total(self.player_hand) > 21:
                     self._reveal_dealer_hole_card()
                     return self._get_state(), -self.current_bet, True, {"msg": "Player Busts"}
-                return self._get_state(), 0, False, {"msg": "Player Hits"}
+                return self._get_state(), 0, False, {"msg": "Player Hits"}  # still playing, no reward yet
 
             elif action == STAND:
                 dealer_total = self._play_dealer_hand()
@@ -118,6 +120,7 @@ class SixDeckBlackjack:
     # Helper
 
     def _build_shoe(self):
+        """Shuffle a new six-deck shoe. T = ten-face cards."""
         # Creates a shuffled 6-deck shoe. 'T' represents 10, J, Q, K
         deck = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'T', 'T', 'T', 'A'] * 4
         shoe = deck * 6
@@ -134,12 +137,13 @@ class SixDeckBlackjack:
 
     def _track_card(self, card):
         """Record a revealed card in the Hi-Lo deck history."""
+        # buckets: [2,3,4,5,6,7,8,9,T,A] — low cards (2-6) vs high (T,A) drive the count
         if card == 'A':
             index = 9
         elif card == 'T':
             index = 8
         else:
-            index = int(card) - 2
+            index = int(card) - 2  # '2' -> bucket 0, '9' -> bucket 7
         self.deck_history[index] += 1
 
     def _draw_card(self, hand, track=True):
@@ -157,6 +161,7 @@ class SixDeckBlackjack:
         self.dealer_hole_revealed = True
 
     def _is_natural_blackjack(self, hand):
+        """Two-card 21."""
         return len(hand) == 2 and self._calculate_total(hand) == 21
 
     def _check_natural_blackjacks_after_deal(self):
@@ -166,6 +171,7 @@ class SixDeckBlackjack:
         The hole card is revealed only when at least one natural is present.
         """
         player_bj = self._is_natural_blackjack(self.player_hand)
+        # dealer hole isn't tracked yet, but we can still check their two-card total
         dealer_bj = self._is_natural_blackjack(self.dealer_hand)
 
         if not player_bj and not dealer_bj:
@@ -180,6 +186,7 @@ class SixDeckBlackjack:
         return -self.current_bet, "Dealer Natural Blackjack"
 
     def _calculate_total(self, hand):
+        """Hand value with aces counted."""
         total, _ = self._hand_info(hand)
         return total
 
@@ -249,6 +256,7 @@ class SixDeckBlackjack:
 
         num_cards = len(self.player_hand)
 
+        # all features scaled to ~[0,1] so the network doesn't fight huge raw values
         return np.array([
             float(self.phase),
             player_total / 21.0,
@@ -259,7 +267,7 @@ class SixDeckBlackjack:
         ], dtype=np.float32)
 
     def _get_true_count(self):
-        """Calculates the Hi-Lo True Count."""
+        """Hi-Lo running count divided by decks left in the shoe."""
         # Indices 0-4 are cards 2 through 6 (+1 value)
         low_cards = np.sum(self.deck_history[0:5])
         # Indices 8-9 are 10s and Aces (-1 value)
@@ -274,18 +282,18 @@ class SixDeckBlackjack:
 
 
 def legal_action_mask_batch(states: np.ndarray) -> np.ndarray:
-    """Vectorized legal-action mask mirroring ``legal_actions()`` for state rows.
-
-    State layout: [phase, player_total/21, upcard/11, true_count/10,
+    """Batch version of legal_actions() — one bool row per state.
+    
+     State layout: [phase, player_total/21, upcard/11, true_count/10,
     is_soft, num_player_cards/10].  Returns a bool array of shape
-    (batch, NUM_ACTIONS).
-    """
+    (batch, NUM_ACTIONS)."""
     batch_size = states.shape[0]
     mask = np.zeros((batch_size, NUM_ACTIONS), dtype=bool)
 
-    is_betting = states[:, 0] < 0.5
+    # reverse-engineer phase and hand size from the normalized state vector
+    is_betting = states[:, 0] < 0.5   # phase 0 normalizes to 0.0
     is_playing = ~is_betting
-    has_two_cards = np.round(states[:, 5] * 10) == 2
+    has_two_cards = np.round(states[:, 5] * 10) == 2  # feature 5 is num_cards / 10
 
     mask[is_betting, BET_10] = True
     mask[is_betting, BET_50] = True
@@ -299,6 +307,7 @@ def legal_action_mask_batch(states: np.ndarray) -> np.ndarray:
 
 
 def random_agent_test(env, episodes=1000):
+    """Crash test: random legal actions for N hands."""
     print("Starting Random Agent Stress Test...")
     for episode in range(episodes):
         state = env.reset()
@@ -310,6 +319,7 @@ def random_agent_test(env, episodes=1000):
 
 
 def human_play_test(env):
+    """Play blackjack yourself in the terminal to debug the env."""
     print("Welcome to Terminal Blackjack Debugger")
 
     while True:

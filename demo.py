@@ -33,6 +33,7 @@ ACTION_NAMES = {
 
 
 def parse_args():
+    """CLI args for the terminal demo."""
     parser = argparse.ArgumentParser(description="Demo the trained blackjack DQN in the terminal.")
     parser.add_argument("--hands", type=int, default=20, help="Number of hands to play.")
     parser.add_argument(
@@ -52,20 +53,24 @@ def parse_args():
 
 
 def set_seed(seed: int) -> None:
+    """Fix random/numpy/torch seeds."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
 
 def format_card(card: str) -> str:
+    """Show T as 10 in the terminal."""
     return "10" if card == "T" else card
 
 
 def format_hand(cards: list[str]) -> str:
+    """Space-separated card string for display."""
     return " ".join(format_card(c) for c in cards)
 
 
 def format_dealer(env: SixDeckBlackjack) -> str:
+    """Dealer line — upcard only until the hole card is revealed."""
     if not env.dealer_hand:
         return "—"
     upcard = format_card(env.dealer_hand[0])
@@ -77,16 +82,19 @@ def format_dealer(env: SixDeckBlackjack) -> str:
 
 
 def format_actions(actions: list[int]) -> str:
+    """Transform action IDs into a readable sequence like 'Bet $50 → Hit'."""
     return " → ".join(ACTION_NAMES.get(a, f"Action {a}") for a in actions)
 
 
 def play_demo(args) -> None:
+    """Run a few hands with the trained agent and print each step."""
     if not os.path.isfile(args.model_path):
         print(f"Model not found: {args.model_path}", file=sys.stderr)
         sys.exit(1)
 
     set_seed(args.seed)
     env = SixDeckBlackjack()
+    # tiny replay buffer — we're only doing inference, not training
     agent = BlackjackAgent(state_dim=STATE_DIM, action_dim=7, batch_size=128, buffer_capacity=1)
     agent.load(args.model_path)
     agent.policy_net.eval()
@@ -97,13 +105,13 @@ def play_demo(args) -> None:
 
     for hand_num in range(1, args.hands + 1):
         state = env.reset()
-        true_count = env._get_true_count()
+        true_count = env._get_true_count()  # count at bet time, before deal
         done = False
         hand_reward = 0.0
         actions_taken: list[int] = []
 
         while not done:
-            action = agent.select_action(state, env.legal_actions(), epsilon=0.0)
+            action = agent.select_action(state, env.legal_actions(), epsilon=0.0)  # greedy, no random
             actions_taken.append(action)
             state, reward, done, info = env.step(action)
             hand_reward += reward
@@ -130,6 +138,7 @@ def play_demo(args) -> None:
 
 
 def main():
+    """Entry point."""
     play_demo(parse_args())
 
 

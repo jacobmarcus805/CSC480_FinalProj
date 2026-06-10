@@ -18,6 +18,7 @@ ROLLING_WINDOW = 100
 
 
 def parse_args():
+    """Parse command-line flags."""
     parser = argparse.ArgumentParser(description="Plot blackjack RL telemetry from CSV files.")
     parser.add_argument("--training-csv", default=DEFAULT_TRAINING_CSV, help="Training telemetry CSV.")
     parser.add_argument("--baseline-csv", default=DEFAULT_BASELINE_CSV, help="Random baseline CSV.")
@@ -38,6 +39,7 @@ def parse_args():
 
 
 def load_csv(path: str) -> list[dict] | None:
+    """Load a telemetry CSV, or None if the file isn't there."""
     if not os.path.isfile(path):
         return None
     with open(path, newline="") as f:
@@ -45,22 +47,27 @@ def load_csv(path: str) -> list[dict] | None:
 
 
 def to_float(series: list[dict], key: str) -> np.ndarray:
+    """Grab one number column from the CSV rows."""
     return np.array([float(row[key]) for row in series], dtype=np.float64)
 
 
 def to_int(series: list[dict], key: str) -> np.ndarray:
-    return np.array([int(float(row[key])) for row in series], dtype=np.int64)
+    """Grab one int column from the CSV rows."""
+    return np.array([int(float(row[key])) for row in series], dtype=np.int64)  # everything comes in as a string
 
 
 def to_str(series: list[dict], key: str) -> list[str]:
+    """Grab one text column from the CSV rows."""
     return [row[key] for row in series]
 
 
 def ensure_output_dir(path: str) -> None:
+    """Make the results folder if needed."""
     os.makedirs(path, exist_ok=True)
 
 
 def save_figure(fig, output_dir: str, filename: str) -> str:
+    """Save the plot as a PNG and close it so we don't leak memory."""
     ensure_output_dir(output_dir)
     out_path = os.path.join(output_dir, filename)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -69,10 +76,12 @@ def save_figure(fig, output_dir: str, filename: str) -> str:
 
 
 def load_training_data(args) -> list[dict] | None:
+    """Prefer the CSV; fall back to old .npy format if that's all we have."""
     rows = load_csv(args.training_csv)
     if rows is not None:
         return rows
 
+    # older runs saved rewards/epsilons as a numpy dict instead of CSV
     if os.path.isfile(args.legacy_npy):
         data = np.load(args.legacy_npy, allow_pickle=True).item()
         rewards = data["rewards"]
@@ -100,6 +109,7 @@ def load_training_data(args) -> list[dict] | None:
 
 
 def plot_training_rolling_reward(training_rows: list[dict], output_dir: str) -> str | None:
+    """Is the agent getting better over time?"""
     episodes = to_int(training_rows, "episode")
     rolling = to_float(training_rows, "rolling_avg_reward")
 
@@ -116,6 +126,7 @@ def plot_training_rolling_reward(training_rows: list[dict], output_dir: str) -> 
 
 
 def plot_training_bankroll(training_rows: list[dict], output_dir: str) -> str | None:
+    """Running total $ won or lost across all training hands."""
     episodes = to_int(training_rows, "episode")
     rewards = to_float(training_rows, "total_reward")
     bankroll = np.cumsum(rewards)
@@ -133,6 +144,7 @@ def plot_training_bankroll(training_rows: list[dict], output_dir: str) -> str | 
 
 
 def plot_epsilon_decay(training_rows: list[dict], output_dir: str) -> str | None:
+    """When did the agent stop exploring randomly?"""
     episodes = to_int(training_rows, "episode")
     epsilon = to_float(training_rows, "epsilon")
 
@@ -153,6 +165,7 @@ def plot_agent_vs_baseline_reward(
     baseline_rows: list[dict] | None,
     output_dir: str,
 ) -> str | None:
+    """Who loses less per hand — us or random play?"""
     if eval_rows is None or baseline_rows is None:
         return None
 
@@ -174,6 +187,7 @@ def plot_agent_vs_baseline_reward(
 
 
 def outcome_rates(rows: list[dict]) -> dict[str, float]:
+    """What % of hands ended in a win, loss, or push."""
     outcomes = to_str(rows, "outcome")
     n = len(outcomes)
     return {
@@ -188,6 +202,7 @@ def plot_win_loss_push_comparison(
     baseline_rows: list[dict] | None,
     output_dir: str,
 ) -> str | None:
+    """Win/loss/push breakdown — agent vs random."""
     if eval_rows is None or baseline_rows is None:
         return None
 
@@ -202,6 +217,7 @@ def plot_win_loss_push_comparison(
     width = 0.35
 
     fig, ax = plt.subplots(figsize=(9, 5))
+    # nudge the bars left/right so they don't stack on top of each other
     ax.bar(x - width / 2, eval_vals, width, label="Trained Agent", color="tab:blue")
     ax.bar(x + width / 2, baseline_vals, width, label="Random Baseline", color="tab:orange")
     ax.set_title("Win / Loss / Push Rate Comparison")
@@ -215,10 +231,12 @@ def plot_win_loss_push_comparison(
 
 
 def plot_illegal_action_rate(training_rows: list[dict], output_dir: str, window: int) -> str | None:
+    """Illegal moves per step — should drop to ~0 as exploration fades."""
     illegal = to_float(training_rows, "illegal_action_count")
     actions = to_float(training_rows, "num_actions")
     episodes = to_int(training_rows, "episode")
 
+    # divide illegal count by total actions that hand (not all hands have the same length)
     per_step_rate = np.divide(
         illegal,
         actions,
@@ -228,8 +246,8 @@ def plot_illegal_action_rate(training_rows: list[dict], output_dir: str, window:
 
     if len(per_step_rate) >= window:
         kernel = np.ones(window) / window
-        rolling_rate = np.convolve(per_step_rate, kernel, mode="valid")
-        rolling_episodes = episodes[window - 1:]
+        rolling_rate = np.convolve(per_step_rate, kernel, mode="valid")  # smooth it out
+        rolling_episodes = episodes[window - 1:]  # convolve eats the first window-1 points
     else:
         rolling_rate = per_step_rate
         rolling_episodes = episodes
@@ -247,9 +265,10 @@ def plot_illegal_action_rate(training_rows: list[dict], output_dir: str, window:
 
 
 def average_bet_by_true_count(rows: list[dict]) -> tuple[list[int], list[float]]:
+    """Average bet size grouped by true count when the bet was placed."""
     buckets: dict[int, list[float]] = defaultdict(list)
     for row in rows:
-        tc = int(float(row["true_count_at_bet"]))
+        tc = int(float(row["true_count_at_bet"]))  # e.g. all TC=+2 hands go in one bucket
         buckets[tc].append(float(row["bet_amount"]))
     counts = sorted(buckets.keys())
     avg_bets = [float(np.mean(buckets[c])) for c in counts]
@@ -261,6 +280,7 @@ def plot_average_bet_by_true_count(
     baseline_rows: list[dict] | None,
     output_dir: str,
 ) -> str | None:
+    """Does the agent bet bigger when the count is good?"""
     if eval_rows is None and baseline_rows is None:
         return None
 
@@ -291,6 +311,7 @@ def plot_average_bet_by_true_count(
 
 
 def main():
+    """Make plots for whatever CSVs exist, skip the rest."""
     args = parse_args()
     created: list[str] = []
     skipped: list[str] = []
@@ -330,7 +351,7 @@ def main():
     else:
         skipped.append("07_average_bet_by_true_count.png (missing eval and baseline CSV)")
 
-    created = [p for p in created if p]
+    created = [p for p in created if p]  # drop any None returns from missing data
 
     print(f"Saved {len(created)} plot(s) to {args.output_dir}/")
     for path in created:
