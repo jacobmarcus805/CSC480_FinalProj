@@ -8,13 +8,25 @@ import sys
 from collections import defaultdict
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+from matplotlib.patches import Patch
 import numpy as np
+
+from environment import HIT, STAND, DOUBLE, STATE_DIM
+from basic_strategy import DEALER_UPCARDS, ACTION_TO_CHAR, optimal_action
 
 DEFAULT_TRAINING_CSV = "training_telemetry.csv"
 DEFAULT_BASELINE_CSV = "baseline_telemetry.csv"
 DEFAULT_EVAL_CSV = "eval_telemetry.csv"
+DEFAULT_MODEL_PATH = "blackjack_card_counter_v1.pth"
 DEFAULT_OUTPUT_DIR = "results"
 ROLLING_WINDOW = 100
+
+HARD_TOTALS = list(range(20, 4, -1))   # 20 down to 5
+SOFT_TOTALS = list(range(20, 12, -1))  # soft 20 (A,9) down to soft 13 (A,2)
+ACTION_CODE = {HIT: 0, STAND: 1, DOUBLE: 2}
+ACTION_CMAP = ListedColormap(["#e74c3c", "#2ecc71", "#f1c40f"])  # H red, S green, D yellow
+DIFF_CMAP = ListedColormap(["#dfe6e9", "#c0392b"])               # match gray, mismatch red
 
 
 def parse_args():
@@ -23,6 +35,7 @@ def parse_args():
     parser.add_argument("--training-csv", default=DEFAULT_TRAINING_CSV, help="Training telemetry CSV.")
     parser.add_argument("--baseline-csv", default=DEFAULT_BASELINE_CSV, help="Random baseline CSV.")
     parser.add_argument("--eval-csv", default=DEFAULT_EVAL_CSV, help="Trained agent eval CSV.")
+    parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH, help="Trained model for the strategy chart.")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Folder for saved PNG plots.")
     parser.add_argument(
         "--rolling-window",
@@ -310,6 +323,119 @@ def plot_average_bet_by_true_count(
     return save_figure(fig, output_dir, "07_average_bet_by_true_count.png")
 
 
+def _make_state(player_total: int, upcard_val: int, is_soft: bool, true_count: float) -> np.ndarray:
+
+    return np.array([
+        1.0,                       
+        player_total / 21.0,
+        upcard_val / 11.0,
+        true_count / 10.0,
+        1.0 if is_soft else 0.0,
+        2 / 10.0,                  
+    ], dtype=np.float32)
+
+
+def _build_strategy_grids(agent, totals, is_soft, true_count):
+    """Sweep the agent over a grid of two-card states; return learned/optimal action grids."""
+    rows, cols = len(totals), len(DEALER_UPCARDS)
+    learned = np.zeros((rows, cols), dtype=int)
+    optimal = np.zeros((rows, cols), dtype=int)
+    for r, total in enumerate(totals):
+        for c, up in enumerate(DEALER_UPCARDS):
+            state = _make_state(total, up, is_soft, true_count)
+            learned[r, c] = agent.select_action(state, [HIT, STAND, DOUBLE], epsilon=0.0)
+            optimal[r, c] = optimal_action(total, is_soft, up)
+    return learned, optimal
+
+
+def _upcard_labels():
+    return [("A" if v == 11 else str(v)) for v in DEALER_UPCARDS]
+
+
+def _row_labels(totals, is_soft):
+    if is_soft:
+        return [f"A,{t - 11}  ({t})" for t in totals]  # soft 18 = A,7, etc.
+    return [str(t) for t in totals]
+
+
+def _draw_policy(ax, action_grid, totals, is_soft, title):
+    codes = np.vectorize(ACTION_CODE.get)(action_grid)
+    ax.imshow(codes, cmap=ACTION_CMAP, vmin=0, vmax=2, aspect="auto")
+    for r in range(action_grid.shape[0]):
+        for c in range(action_grid.shape[1]):
+            ax.text(c, r, ACTION_TO_CHAR[action_grid[r, c]],
+                    ha="center", va="center", fontsize=8, fontweight="bold", color="black")
+    ax.set_title(title, fontsize=11)
+    ax.set_xticks(range(len(DEALER_UPCARDS)))
+    ax.set_xticklabels(_upcard_labels(), fontsize=8)
+    ax.set_yticks(range(len(totals)))
+    ax.set_yticklabels(_row_labels(totals, is_soft), fontsize=8)
+    ax.set_xlabel("Dealer upcard", fontsize=9)
+
+
+def _draw_diff(ax, learned, optimal, totals, is_soft, title):
+    mism = (learned != optimal).astype(int)
+    ax.imshow(mism, cmap=DIFF_CMAP, vmin=0, vmax=1, aspect="auto")
+    for r in range(mism.shape[0]):
+        for c in range(mism.shape[1]):
+            if mism[r, c]:  
+                ax.text(c, r, f"{ACTION_TO_CHAR[learned[r, c]]}/{ACTION_TO_CHAR[optimal[r, c]]}",
+                        ha="center", va="center", fontsize=6.5, color="white", fontweight="bold")
+    ax.set_title(title, fontsize=11)
+    ax.set_xticks(range(len(DEALER_UPCARDS)))
+    ax.set_xticklabels(_upcard_labels(), fontsize=8)
+    ax.set_yticks(range(len(totals)))
+    ax.set_yticklabels(_row_labels(totals, is_soft), fontsize=8)
+    ax.set_xlabel("Dealer upcard", fontsize=9)
+
+
+def plot_strategy_chart(model_path: str, output_dir: str, true_count: float = 0.0) -> str | None:
+    """Render learned vs. optimal play strategy heatmaps + match score, or None if no model."""
+    if not os.path.isfile(model_path):
+        return None
+
+    from agent import BlackjackAgent
+
+    agent = BlackjackAgent(state_dim=STATE_DIM, action_dim=7, batch_size=128, buffer_capacity=1)
+    agent.load(model_path)
+    agent.policy_net.eval()
+
+    h_learn, h_opt = _build_strategy_grids(agent, HARD_TOTALS, False, true_count)
+    s_learn, s_opt = _build_strategy_grids(agent, SOFT_TOTALS, True, true_count)
+
+    fig, axes = plt.subplots(2, 3, figsize=(16, 11))
+    _draw_policy(axes[0, 0], h_learn, HARD_TOTALS, False, "Learned — Hard totals")
+    _draw_policy(axes[0, 1], h_opt, HARD_TOTALS, False, "Optimal — Hard totals")
+    _draw_diff(axes[0, 2], h_learn, h_opt, HARD_TOTALS, False, "Disagreements — Hard")
+    _draw_policy(axes[1, 0], s_learn, SOFT_TOTALS, True, "Learned — Soft totals")
+    _draw_policy(axes[1, 1], s_opt, SOFT_TOTALS, True, "Optimal — Soft totals")
+    _draw_diff(axes[1, 2], s_learn, s_opt, SOFT_TOTALS, True, "Disagreements — Soft")
+    axes[0, 0].set_ylabel("Player total", fontsize=9)
+    axes[1, 0].set_ylabel("Player soft total", fontsize=9)
+
+    hard_match = float(np.mean(h_learn == h_opt))
+    soft_match = float(np.mean(s_learn == s_opt))
+    total_match = (np.sum(h_learn == h_opt) + np.sum(s_learn == s_opt)) / (h_learn.size + s_learn.size)
+
+    legend = [
+        Patch(facecolor="#e74c3c", label="Hit"),
+        Patch(facecolor="#2ecc71", label="Stand"),
+        Patch(facecolor="#f1c40f", label="Double"),
+        Patch(facecolor="#c0392b", label="Disagreement (learned/optimal)"),
+    ]
+    fig.legend(handles=legend, loc="lower center", ncol=4, fontsize=9, frameon=False)
+    fig.suptitle(
+        f"Learned DQN policy vs. optimal basic strategy  (true count = {true_count:g})\n"
+        f"Overall match: {total_match:.1%}   (hard {hard_match:.1%}, soft {soft_match:.1%})",
+        fontsize=13,
+    )
+    fig.tight_layout(rect=(0, 0.04, 1, 0.95))
+    out_path = save_figure(fig, output_dir, "08_strategy_chart.png")
+    print(f"  strategy chart match vs optimal: {total_match:.1%} "
+          f"(hard {hard_match:.1%}, soft {soft_match:.1%})")
+    return out_path
+
+
 def main():
     """Make plots for whatever CSVs exist, skip the rest."""
     args = parse_args()
@@ -350,6 +476,12 @@ def main():
         created.append(path)
     else:
         skipped.append("07_average_bet_by_true_count.png (missing eval and baseline CSV)")
+
+    path = plot_strategy_chart(args.model_path, args.output_dir)
+    if path:
+        created.append(path)
+    else:
+        skipped.append(f"08_strategy_chart.png (missing model: {args.model_path})")
 
     created = [p for p in created if p]  # drop any None returns from missing data
 
